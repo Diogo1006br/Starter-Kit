@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# Creates an independent project from this starter.
+#
+#   bin/new-project <name> [--dir PATH] [--backend-port N] [--frontend-port N]
+#                          [--postgres-port N] [--redis-port N] [--dry-run] [--no-git]
+#
+# Everything is validated before anything is written. Docker is never started
+# and `make init` is never run: the new project is only prepared.
+set -euo pipefail
+
+TEMPLATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+
+# Base ports of the starter; automatic selection searches upwards from here.
+BASE_BACKEND=8080
+BASE_FRONTEND=5174
+BASE_POSTGRES=5440
+BASE_REDIS=6390
+PORT_WINDOW=500
+MIN_PORT=1024
+MAX_PORT=65535
+
+# Template-only paths that never belong in a generated project.
+EXCLUDE_TEMPLATE='^(bin/new-project|tests/|docs/|README\.md$)'
+# Defence in depth on top of `git ls-files`: local, sensitive or generated files.
+EXCLUDE_LOCAL='(^|/)(\.git|node_modules|vendor|dist|coverage|\.idea|\.vscode)/|(^|/)\.env(\.|$)|\.log$|\.sqlite3?$|\.tsbuildinfo$|(^|/)\.DS_Store$|\.phpunit\.(result\.)?cache|(^|/)auth\.json$'
+
+usage() {
+  cat <<'EOF'
+Usage: bin/new-project <name> [options]
+
+  <name>               Lowercase slug: letters, digits and single hyphens, starts
+                       with a letter, 2-40 chars (e.g. my-app).
+  --dir PATH           Destination directory (the project itself, not its parent).
+                       Default: a sibling of the starter, <starter-parent>/<name>.
+                       It must not exist; its parent must.
+  --backend-port N     Host port for the API
+  --frontend-port N    Host port for the Vite app
+  --postgres-port N    Host port for PostgreSQL (bound to 127.0.0.1)
+  --redis-port N       Host port for Redis (bound to 127.0.0.1)
+  --dry-run            Validate and print the plan; create nothing.
+  --no-git             Do not run `git init` in the new project.
+  -h, --help           Show this help.
+
+Ports must be in 1024-65535, distinct and free on this machine. Ports left out
+are chosen deterministically from the project name: base port (8080, 5174,
+5440, 6390) plus a name-derived offset (0-499), moving to the next free port.
+EOF
+}
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# --- argument parsing --------------------------------------------------------
+name="" dest="" dry_run=0 init_git=1
+p_backend="" p_frontend="" p_postgres="" p_redis=""
+
+need_value() { [ $# -ge 2 ] && [ -n "$2" ] || die "$1 requires a value"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --dir) need_value "$@"; dest="$2"; shift 2 ;;
+    --backend-port) need_value "$@"; p_backend="$2"; shift 2 ;;
+    --frontend-port) need_value "$@"; p_frontend="$2"; shift 2 ;;
+    --postgres-port) need_value "$@"; p_postgres="$2"; shift 2 ;;
+    --redis-port) need_value "$@"; p_redis="$2"; shift 2 ;;
+    --dry-run) dry_run=1; shift ;;
+    --no-git) init_git=0; shift ;;
+    --dir=*|--backend-port=*|--frontend-port=*|--postgres-port=*|--redis-port=*)
+      set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;
+    -*) die "unknown option: $1 (see --help)" ;;
+    *) [ -z "$name" ] || die "unexpected argument: $1"; name="$1"; shift ;;
+  esac
+done
+
+[ -n "$name" ] || { usage >&2; exit 1; }
+
+# --- name --------------------------------------------------------------------
+if ! printf '%s' "$name" | grep -Eq '^[a-z][a-z0-9]*(-[a-z0-9]+)*$'; then
+  die "invalid project name '$name': use lowercase letters, digits and single hyphens, starting with a letter (e.g. my-app)"
+fi
+if [ "${#name}" -lt 2 ] || [ "${#name}" -gt 40 ]; then
+  die "invalid project name '$name': must be 2-40 characters"
+fi
+slug="$name"
+
+# "my-app" -> "My App" (shown in the UI and used as APP_NAME).
+title=""
+IFS=- read -r -a words <<<"$slug"
+for w in "${words[@]}"; do
+  first="$(printf '%s' "${w:0:1}" | tr '[:lower:]' '[:upper:]')"
+  title="${title:+$title }${first}${w:1}"
+done
+
+# --- destination -------------------------------------------------------------
+if [ -z "$dest" ]; then
+  dest="$(dirname "$TEMPLATE_DIR")/$slug"
+fi
+case "$dest" in /*) ;; *) dest="$PWD/$dest" ;; esac
+dest_parent="$(dirname "$dest")"
+dest_base="$(basename "$dest")"
+[ -d "$dest_parent" ] || die "parent directory does not exist: $dest_parent"
+dest="$(cd "$dest_parent" && pwd -P)/$dest_base"
+if [ -e "$dest" ] || [ -L "$dest" ]; then
+  die "destination already exists, refusing to overwrite: $dest"
+fi
+case "$dest/" in "$TEMPLATE_DIR/"*) die "destination must be outside the starter: $dest" ;; esac
+
+# --- ports -------------------------------------------------------------------
+validate_port() { # label value
+  if printf '%s' "$2" | grep -Eq '^[1-9][0-9]{3,4}$' && [ "$2" -ge "$MIN_PORT" ] && [ "$2" -le "$MAX_PORT" ]; then
+    return 0
+  fi
+  die "$1 port '$2' is invalid: use an integer between $MIN_PORT and $MAX_PORT"
+}
+
+# Read-only probes; nothing is bound and Docker is not contacted.
+port_in_use() {
+  local p="$1"
+  if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
+    return 0
+  fi
+  # lsof only sees what this user may inspect; a plain connect catches the rest.
+  if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+[ -z "$p_backend" ]  || validate_port backend  "$p_backend"
+[ -z "$p_frontend" ] || validate_port frontend "$p_frontend"
+[ -z "$p_postgres" ] || validate_port postgres "$p_postgres"
+[ -z "$p_redis" ]    || validate_port redis    "$p_redis"
+
+chosen=" "
+claim() { chosen="$chosen$1 "; }
+is_claimed() { case "$chosen" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+# Explicit ports first: duplicates and busy ports are errors, never silently moved.
+for pair in "backend:$p_backend" "frontend:$p_frontend" "postgres:$p_postgres" "redis:$p_redis"; do
+  label="${pair%%:*}" value="${pair#*:}"
+  [ -n "$value" ] || continue
+  if is_claimed "$value"; then die "port $value is assigned to more than one service"; fi
+  if port_in_use "$value"; then die "$label port $value is already in use on this machine"; fi
+  claim "$value"
+done
+
+hash="$(printf '%s' "$slug" | cksum | awk '{print $1}')"
+offset=$((hash % PORT_WINDOW))
+
+pick_port() { # label base -> prints a free port
+  local label="$1" base="$2" i cand
+  for ((i = 0; i < PORT_WINDOW; i++)); do
+    cand=$((base + (offset + i) % PORT_WINDOW))
+    if is_claimed "$cand" || port_in_use "$cand"; then continue; fi
+    echo "$cand"
+    return 0
+  done
+  die "no free $label port in $base-$((base + PORT_WINDOW - 1)); pass --$label-port explicitly"
+}
+
+if [ -z "$p_backend" ];  then p_backend="$(pick_port backend "$BASE_BACKEND")";   claim "$p_backend";  fi
+if [ -z "$p_frontend" ]; then p_frontend="$(pick_port frontend "$BASE_FRONTEND")"; claim "$p_frontend"; fi
+if [ -z "$p_postgres" ]; then p_postgres="$(pick_port postgres "$BASE_POSTGRES")"; claim "$p_postgres"; fi
+if [ -z "$p_redis" ];    then p_redis="$(pick_port redis "$BASE_REDIS")";          claim "$p_redis";    fi
+
+echo "Project:   $slug ($title)"
+echo "Directory: $dest"
+echo "Ports:     backend=$p_backend frontend=$p_frontend postgres=$p_postgres redis=$p_redis"
+
+if [ "$dry_run" -eq 1 ]; then
+  echo "Dry run: nothing was created."
+  exit 0
+fi
+
+# --- template sanity ---------------------------------------------------------
+git -C "$TEMPLATE_DIR" rev-parse --git-dir >/dev/null 2>&1 \
+  || die "the starter must be a git checkout (files are taken from 'git ls-files')"
+if [ -n "$(git -C "$TEMPLATE_DIR" status --porcelain)" ]; then
+  echo "warning: the starter has uncommitted changes; tracked files are copied as they are on disk." >&2
+fi
+
+# --- copy --------------------------------------------------------------------
+mkdir "$dest"
+finished=0
+cleanup() { [ "$finished" -eq 1 ] || { echo "Aborted: removing $dest" >&2; rm -rf "$dest"; }; }
+trap cleanup EXIT
+
+while IFS= read -r -d '' rel; do
+  if printf '%s' "$rel" | grep -Eq "$EXCLUDE_TEMPLATE"; then continue; fi
+  if [ "$(basename "$rel")" != ".env.example" ] && printf '%s' "$rel" | grep -Eq "$EXCLUDE_LOCAL"; then continue; fi
+  if [ ! -e "$TEMPLATE_DIR/$rel" ] && [ ! -L "$TEMPLATE_DIR/$rel" ]; then continue; fi
+  mkdir -p "$dest/$(dirname "$rel")"
+  cp -pP "$TEMPLATE_DIR/$rel" "$dest/$rel"
+done < <(git -C "$TEMPLATE_DIR" ls-files -z)
+
+# --- rename ------------------------------------------------------------------
+# Literal, file-specific replacements. A pattern that no longer matches means the
+# starter drifted from this script, which must fail loudly, not silently skip.
+replace() { # file old new
+  local file="$dest/$1" content out
+  [ -f "$file" ] || die "expected file missing in the copy: $1"
+  content="$(cat "$file"; printf x)"
+  content="${content%x}"
+  case "$content" in *"$2"*) ;; *) die "pattern not found in $1: $2" ;; esac
+  out="${content//"$2"/$3}"
+  printf '%s' "$out" >"$file"
+}
+
+set_env() { # file KEY value
+  local file="$dest/$1" tmp
+  grep -qE "^$2=" "$file" || die "key $2 not found in $1"
+  tmp="$(mktemp)"
+  awk -v k="$2" -v v="$3" 'BEGIN{FS=OFS="="} $1==k && !done {print k "=" v; done=1; next} {print}' "$file" >"$tmp"
+  cat "$tmp" >"$file"
+  rm -f "$tmp"
+}
+
+replace backend/composer.json '"name": "starter/app"' "\"name\": \"$slug/app\""
+replace backend/composer.json 'of the full-stack starter kit.' "of $title."
+replace frontend/package.json '"name": "starter-frontend"' "\"name\": \"$slug-frontend\""
+replace frontend/package-lock.json '"name": "starter-frontend"' "\"name\": \"$slug-frontend\""
+replace frontend/index.html '<title>Starter</title>' "<title>$title</title>"
+replace frontend/src/App.tsx '>Starter</h1>' ">$title</h1>"
+replace frontend/tests/App.test.tsx "app: 'Starter'" "app: '$title'"
+replace frontend/.env.example 'http://localhost:8080/api/v1' "http://localhost:$p_backend/api/v1"
+
+set_env .env.example COMPOSE_PROJECT_NAME "$slug"
+set_env .env.example APP_NAME "\"$title\""
+set_env .env.example APP_URL "http://localhost:$p_backend"
+set_env .env.example BACKEND_PORT "$p_backend"
+set_env .env.example FRONTEND_PORT "$p_frontend"
+set_env .env.example POSTGRES_HOST_PORT "$p_postgres"
+set_env .env.example REDIS_HOST_PORT "$p_redis"
+
+# Local config: same values, secrets left blank on purpose. `make init` (bin/setup-env)
+# generates new DB/Redis passwords, HOST_UID/GID and APP_KEY for this project only.
+# CORS_ALLOWED_ORIGINS is derived from FRONTEND_PORT by compose.yaml.
+cp "$dest/.env.example" "$dest/.env"
+
+cat >"$dest/README.md" <<EOF
+# $title
+
+Laravel API + React/TypeScript + PostgreSQL + Redis, all run through Docker.
+
+\`\`\`bash
+make init   # build images, install dependencies, generate secrets and APP_KEY, start, migrate
+make up     # day to day
+make check  # lint, format, tests, build
+make help   # every command
+\`\`\`
+
+Local ports (from \`.env\`): frontend $p_frontend, API $p_backend, PostgreSQL $p_postgres, Redis $p_redis.
+EOF
+
+# --- git ---------------------------------------------------------------------
+if [ "$init_git" -eq 1 ]; then
+  git -C "$dest" init -q -b main
+fi
+
+finished=1
+cat <<EOF
+
+Created $dest
+Docker was not started and make init was not run. To start the project:
+
+  cd $dest
+  make init
+
+It is not verified until make init and make check have been run there.
+Expected: frontend http://localhost:$p_frontend   API http://localhost:$p_backend/api/v1/health
+EOF
