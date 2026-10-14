@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Creates .env from .env.example (if missing) and fills what must be unique per
+# machine: database/redis passwords and the host UID/GID. It never overwrites a
+# value that is already set, so it is safe to run repeatedly.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+[ -f .env ] || cp .env.example .env
+
+# Laravel expects backend/.env to exist (phpdotenv warns otherwise, which `artisan test`
+# reports). It stays empty on purpose: every value is injected by compose from the
+# root .env, and process variables take precedence over this file.
+if [ ! -f backend/.env ]; then
+  printf "# Intentionally empty: configuration comes from the root .env via docker compose.\n" > backend/.env
+fi
+
+get() { grep -E "^$1=" .env | head -n1 | cut -d= -f2-; }
+
+set_var() {
+  local key="$1" value="$2" tmp
+  tmp="$(mktemp)"
+  awk -v k="$key" -v v="$value" 'BEGIN{FS=OFS="="} $1==k && !done {print k "=" v; done=1; next} {print}' .env >"$tmp"
+  cat "$tmp" >.env
+  rm -f "$tmp"
+}
+
+fill() {
+  [ -n "$(get "$1")" ] || set_var "$1" "$2"
+}
+
+secret() { openssl rand -hex 16; }
+
+fill DB_PASSWORD "$(secret)"
+fill REDIS_PASSWORD "$(secret)"
+fill HOST_UID "$(id -u)"
+fill HOST_GID "$(id -g)"
+
+echo ".env ready (existing values were kept)."

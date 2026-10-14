@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Same suite as phpunit.xml, against real PostgreSQL (see `make test-pg`). -->
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="vendor/autoload.php"
+         colors="true"
+         failOnWarning="true"
+>
+    <testsuites>
+        <testsuite name="Unit">
+            <directory>tests/Unit</directory>
+        </testsuite>
+        <testsuite name="Feature">
+            <directory>tests/Feature</directory>
+        </testsuite>
+    </testsuites>
+    <source>
+        <include>
+            <directory>app</directory>
+        </include>
+    </source>
+    <php>
+        <!-- Every variable is set twice (<env> and <server>): Laravel reads $_SERVER first,
+             and the container's own environment (pgsql, redis, ...) must not leak into tests. -->
+        <env name="APP_ENV" force="true" value="testing"/>
+        <server name="APP_ENV" force="true" value="testing"/>
+        <env name="APP_MAINTENANCE_DRIVER" force="true" value="file"/>
+        <server name="APP_MAINTENANCE_DRIVER" force="true" value="file"/>
+        <env name="BCRYPT_ROUNDS" force="true" value="4"/>
+        <server name="BCRYPT_ROUNDS" force="true" value="4"/>
+        <env name="BROADCAST_CONNECTION" force="true" value="null"/>
+        <server name="BROADCAST_CONNECTION" force="true" value="null"/>
+        <env name="CACHE_STORE" force="true" value="array"/>
+        <server name="CACHE_STORE" force="true" value="array"/>
+        <env name="DB_CONNECTION" force="true" value="pgsql"/>
+        <server name="DB_CONNECTION" force="true" value="pgsql"/>
+        <!-- DB_HOST/PORT/USERNAME/PASSWORD come from the container environment.
+             DB_DATABASE is injected by `make test-pg` as <DB_DATABASE>_test, and
+             tests/TestCase.php refuses to run against any database not ending in _test. -->
+        <env name="DB_URL" force="true" value=""/>
+        <server name="DB_URL" force="true" value=""/>
+        <env name="MAIL_MAILER" force="true" value="array"/>
+        <server name="MAIL_MAILER" force="true" value="array"/>
+        <env name="QUEUE_CONNECTION" force="true" value="sync"/>
+        <server name="QUEUE_CONNECTION" force="true" value="sync"/>
+        <env name="SESSION_DRIVER" force="true" value="array"/>
+        <server name="SESSION_DRIVER" force="true" value="array"/>
+        <env name="PULSE_ENABLED" force="true" value="false"/>
+        <server name="PULSE_ENABLED" force="true" value="false"/>
+        <env name="TELESCOPE_ENABLED" force="true" value="false"/>
+        <server name="TELESCOPE_ENABLED" force="true" value="false"/>
+        <env name="NIGHTWATCH_ENABLED" force="true" value="false"/>
+        <server name="NIGHTWATCH_ENABLED" force="true" value="false"/>
+    </php>
+</phpunit>
